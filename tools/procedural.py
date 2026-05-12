@@ -160,8 +160,9 @@ def tool_analyze_procedural_code(ctx: ServerContext, database: str, out_dir: str
         FROM sys.objects o
         JOIN sys.sql_modules m ON o.object_id = m.object_id
         JOIN sys.schemas     s ON o.schema_id = s.schema_id
-        WHERE o.type IN ('P', 'FN', 'IF', 'TF', 'AF')
+        WHERE o.type IN ('P')
           AND o.is_ms_shipped = 0
+          AND s.name NOT IN ('sys', 'cdc')
         ORDER BY o.type_desc, s.name, o.name;
     """)
 
@@ -186,6 +187,7 @@ def tool_analyze_procedural_code(ctx: ServerContext, database: str, out_dir: str
         JOIN sys.types        t ON p.user_type_id = t.user_type_id
         WHERE o.type IN ('P', 'FN', 'IF', 'TF')
           AND o.is_ms_shipped = 0
+          AND s.name NOT IN ('sys', 'cdc')
           AND p.parameter_id > 0
         ORDER BY s.name, o.name, p.parameter_id;
     """)
@@ -207,6 +209,7 @@ def tool_analyze_procedural_code(ctx: ServerContext, database: str, out_dir: str
         JOIN sys.schemas s ON o.schema_id = s.schema_id
         WHERE o.type IN ('P', 'FN', 'IF', 'TF', 'AF')
           AND o.is_ms_shipped = 0
+          AND s.name NOT IN ('sys', 'cdc')
         ORDER BY s.name, o.name, d.referenced_entity_name;
     """)
 
@@ -233,6 +236,7 @@ def tool_analyze_procedural_code(ctx: ServerContext, database: str, out_dir: str
         JOIN sys.objects           o  ON am.object_id   = o.object_id
         JOIN sys.schemas           s  ON o.schema_id    = s.schema_id
         WHERE a.is_user_defined = 1
+          AND s.name NOT IN ('sys', 'cdc')
         ORDER BY a.name, o.name;
     """)
 

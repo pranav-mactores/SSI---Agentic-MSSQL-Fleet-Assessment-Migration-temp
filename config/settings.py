@@ -31,10 +31,10 @@ def _opt(key: str, default: str) -> str:
     return os.getenv(key, default).strip() or default
 
 def get_anthropic_api_key() -> str:
-    """Validate ANTHROPIC_API_KEY is present. Call once at startup."""
-    return _require("ANTHROPIC_API_KEY")
+    """No-op when using Bedrock — kept for backwards compatibility."""
+    return os.getenv("ANTHROPIC_API_KEY", "")
 
-CLAUDE_MODEL    = _opt("CLAUDE_MODEL",    "claude-sonnet-4-20250514")
+CLAUDE_MODEL    = _opt("CLAUDE_MODEL",    "us.anthropic.claude-opus-4-5-20251101-v1:0")
 AGENT_MAX_TURNS = int(_opt("AGENT_MAX_TURNS", "40"))
 ODBC_DRIVER     = _opt("ODBC_DRIVER",     "ODBC Driver 17 for SQL Server")
 CONN_TIMEOUT    = int(_opt("CONN_TIMEOUT",    "30"))

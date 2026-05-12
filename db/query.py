@@ -75,7 +75,7 @@ def _version_hint(error: str, ctx: ServerContext) -> str:
             "is_accelerated_database_recovery_on": "ADR column — requires SQL 2019+",
             "is_change_feed_enabled":       "Synapse Link column — requires SQL 2022+",
             "is_contained":                 "Contained AG column — requires SQL 2022+",
-            "is_remote_data_archive_enabled": "Stretch DB column — requires SQL 2016+",
+            "is_remote_data_archive_enabled": "Stretch DB column — available SQL 2016–2022, removed in SQL 2025+.",
             "temporal_type":                "Temporal Tables column — requires SQL 2016+",
             "masked_columns":               "Dynamic Data Masking — requires SQL 2016+",
             "security_policies":            "Row-Level Security — requires SQL 2016+",
@@ -92,6 +92,10 @@ def _version_hint(error: str, ctx: ServerContext) -> str:
         return "Permission denied. Ensure migration_analyst login has VIEW SERVER STATE and VIEW ANY DEFINITION."
     if "timeout" in err:
         return "Query timed out. Consider adding NOLOCK hint or reducing scope."
+    if year > 2022:
+        return (f"Query failed on SQL Server {ctx.version_str} (unrecognised version — "
+                f"treat as SQL 2022+ equivalent). Some catalog view columns may have changed; "
+                f"check sys.objects joins and remove is_ms_shipped filters if needed.")
     return f"Query failed on SQL Server {year} ({ctx.edition}). May need version-specific rewrite."
 
 

@@ -5,7 +5,7 @@ import pyodbc
 from dataclasses import dataclass
 from config.settings import ODBC_DRIVER, CONN_TIMEOUT
 
-VERSION_YEAR = {12: 2014, 13: 2016, 14: 2017, 15: 2019, 16: 2022}
+VERSION_YEAR = {12: 2014, 13: 2016, 14: 2017, 15: 2019, 16: 2022, 17: 2025}
 
 @dataclass
 class ServerContext:

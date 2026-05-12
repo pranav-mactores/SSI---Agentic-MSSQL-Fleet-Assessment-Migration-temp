@@ -7,16 +7,29 @@ from typing import Any
 def safe_slug(text: str) -> str:
     return re.sub(r'[^A-Za-z0-9_-]', '_', text).strip('_')[:60]
 
+def _norm(v: Any) -> Any:
+    """Convert Python booleans to lowercase strings; leave everything else as-is."""
+    if v is True:  return "true"
+    if v is False: return "false"
+    return v
+
 def write_csv(path: str, rows: list[dict]) -> None:
     if not rows:
         with open(path, "w", newline="", encoding="utf-8") as f:
             f.write("(no data)\n")
         return
-    keys = list(rows[0].keys())
+    # Union of ALL keys across every row so no feature's columns are dropped.
+    # (Using rows[0].keys() alone silently discards columns from later rows.)
+    seen: dict = {}
+    for row in rows:
+        for k in row:
+            seen[k] = None
+    keys = list(seen.keys())
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore", restval="")
         w.writeheader()
-        w.writerows(rows)
+        for row in rows:
+            w.writerow({k: _norm(v) for k, v in row.items()})
     print(f"    [csv] {os.path.basename(path)}  ({len(rows)} rows)")
 
 def read_csv(path: str) -> list[dict]:

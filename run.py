@@ -42,8 +42,8 @@ import textwrap
 from datetime import datetime
 
 # Validate API key is present before doing anything else
-from config.settings import get_anthropic_api_key, AGENT_MAX_TURNS
-get_anthropic_api_key()   # raises a clear error if missing
+from config.settings import get_anthropic_api_key
+get_anthropic_api_key()
 
 from db.connection import connect, detect_server
 from agent.loop    import run_agent
@@ -102,7 +102,7 @@ def process_server(row: dict, out_root: str,
         return
 
     try:
-        report_md = run_agent(ctx, out_dir, max_turns=AGENT_MAX_TURNS)
+        report_md = run_agent(ctx, out_dir)
 
         header = textwrap.dedent(f"""
             # SQL Server Migration Feasibility Assessment

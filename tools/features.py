@@ -10,10 +10,20 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
     csv_rows: list[dict] = []
 
     def record(feature: str, data: list[dict]) -> list[dict]:
-        for row in data:
-            row["_feature"] = feature
-            row["_database"] = database
-            csv_rows.append(row)
+        # Long/key-value format: 5 fixed columns regardless of feature.
+        # Avoids a 150-column header when all features are merged into one CSV.
+        for row_num, row in enumerate(data, 1):
+            for key, value in row.items():
+                if value is True:   value = "true"
+                elif value is False: value = "false"
+                elif value is None:  value = ""
+                csv_rows.append({
+                    "_feature":  feature,
+                    "_database": database,
+                    "_row":      row_num,
+                    "key":       key,
+                    "value":     str(value),
+                })
         return data
 
     def qdb(sql: str) -> list[dict]:
@@ -23,40 +33,55 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
         return rq(ctx, sql)
 
     # ── Service Broker ────────────────────────────────────────────────────────
-    result["service_broker"] = record("service_broker", qdb("""
+    # is_ms_shipped exists on sys.service_queues in SQL <=2022; removed in 2025
+    _sq_filter = "is_ms_shipped = 0" if ctx.version_int < 17 else "1=1"
+    result["service_broker"] = record("service_broker", qdb(f"""
         SELECT
           (SELECT is_broker_enabled FROM sys.databases WHERE name=DB_NAME()) AS broker_enabled,
-          (SELECT COUNT(*) FROM sys.service_queues    WHERE is_ms_shipped=0) AS queues,
-          (SELECT COUNT(*) FROM sys.services          WHERE is_ms_shipped=0) AS services,
-          (SELECT COUNT(*) FROM sys.service_contracts WHERE is_ms_shipped=0) AS contracts,
-          (SELECT COUNT(*) FROM sys.routes) AS routes;
+          (SELECT COUNT(*) FROM sys.service_queues    WHERE {_sq_filter}) AS queues,
+          (SELECT COUNT(*) FROM sys.services)          AS services,
+          (SELECT COUNT(*) FROM sys.service_contracts) AS contracts,
+          (SELECT COUNT(*) FROM sys.routes)            AS routes;
     """))
-    result["service_broker_queues"] = record("service_broker_queues", qdb("""
+    result["service_broker_queues"] = record("service_broker_queues", qdb(f"""
         SELECT q.name, q.is_activation_enabled, q.is_poison_message_handling_enabled,
                q.max_readers, s.name AS service_name
         FROM sys.service_queues q
         LEFT JOIN sys.services s ON q.object_id = s.service_queue_id
-        WHERE q.is_ms_shipped=0;
+        WHERE {_sq_filter};
     """))
 
-    # ── CDC  (2008+ Enterprise; Standard/Web 2016+) ───────────────────────────
-    if ctx.v(12) and (ctx.is_enterprise or ctx.v(13)):
-        result["cdc"] = record("cdc", qdb("""
+    # ── CDC  (Enterprise 2012+; Standard/Web 2016+; never Express) ──────────
+    if not ctx.is_express and ctx.v(12) and (ctx.is_enterprise or ctx.v(13)):
+        cdc_info = qdb("""
             SELECT
               (SELECT is_cdc_enabled FROM sys.databases WHERE name=DB_NAME()) AS db_cdc_enabled,
               (SELECT COUNT(*) FROM sys.tables WHERE is_tracked_by_cdc=1)     AS cdc_tracked_tables;
-        """))
-        result["cdc_tables"] = record("cdc_tables", qdb("""
-            SELECT capture_instance, source_schema, source_table, supports_net_changes
-            FROM cdc.change_tables;
-        """))
+        """)
+        result["cdc"] = record("cdc", cdc_info)
+        # cdc.change_tables only exists when CDC is enabled on this specific database
+        cdc_on = (cdc_info and not cdc_info[0].get("_error")
+                  and cdc_info[0].get("db_cdc_enabled"))
+        if cdc_on:
+            result["cdc_tables"] = record("cdc_tables", qdb("""
+                SELECT capture_instance,
+                       OBJECT_SCHEMA_NAME(source_object_id) AS source_schema,
+                       OBJECT_NAME(source_object_id)        AS source_table,
+                       supports_net_changes
+                FROM cdc.change_tables;
+            """))
+        else:
+            result["cdc_tables"] = record("cdc_tables",
+                na_row("CDC not enabled on this database"))
     else:
         result["cdc"] = record("cdc", na_row(f"CDC not available on {ctx.edition}"))
+        result["cdc_tables"] = record("cdc_tables", na_row(f"CDC not available on {ctx.edition}"))
 
     # ── Change Tracking  (2008+, all editions) ────────────────────────────────
     result["change_tracking"] = record("change_tracking", qdb("""
         SELECT
-          (SELECT is_change_tracking_on FROM sys.databases WHERE name=DB_NAME()) AS ct_enabled,
+          CASE WHEN EXISTS (SELECT 1 FROM sys.change_tracking_databases
+                            WHERE database_id=DB_ID()) THEN 1 ELSE 0 END AS ct_enabled,
           (SELECT retention_period FROM sys.change_tracking_databases
            WHERE database_id=DB_ID()) AS retention_period,
           (SELECT retention_period_units_desc FROM sys.change_tracking_databases
@@ -70,17 +95,21 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
                DB_NAME() AS database_name;
     """))
 
-    # ── Always On  (Enterprise 2012+; Standard Basic AG 2016+) ───────────────
-    if ctx.v(12) and (ctx.is_enterprise or ctx.v(13)):
+    # ── Always On  (Enterprise 2012+; Standard Basic AG 2016+; never Express) ─
+    if not ctx.is_express and ctx.v(12) and (ctx.is_enterprise or ctx.v(13)):
         result["always_on"] = record("always_on", qdb("""
-            SELECT d.is_hadr_enabled, ar.replica_server_name,
-                   ar.availability_mode_desc, ar.failover_mode_desc,
-                   ag.name AS ag_name, agl.dns_name AS listener_name
-            FROM sys.databases d
-            LEFT JOIN sys.availability_replicas        ar  ON d.replica_id = ar.replica_id
-            LEFT JOIN sys.availability_groups          ag  ON ar.group_id  = ag.group_id
-            LEFT JOIN sys.availability_group_listeners agl ON ag.group_id  = agl.group_id
-            WHERE d.name=DB_NAME() AND d.is_hadr_enabled=1;
+            SELECT ag.name          AS ag_name,
+                   ar.replica_server_name,
+                   ar.availability_mode_desc,
+                   ar.failover_mode_desc,
+                   agl.dns_name    AS listener_name,
+                   1               AS is_hadr_enabled
+            FROM sys.availability_databases_cluster   adc
+            JOIN  sys.availability_groups          ag  ON adc.group_id = ag.group_id
+            JOIN  sys.availability_replicas        ar  ON ag.group_id  = ar.group_id
+            LEFT JOIN sys.availability_group_listeners agl ON ag.group_id = agl.group_id
+            WHERE adc.database_name = DB_NAME()
+              AND ar.replica_server_name = @@SERVERNAME;
         """))
     else:
         result["always_on"] = record("always_on", na_row(f"Always On not available on {ctx.edition}"))
@@ -218,8 +247,19 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
         result["ddm"] = record("ddm", na_row("DDM requires SQL 2016+"))
 
     # ── TDE ───────────────────────────────────────────────────────────────────
-    result["tde"] = record("tde", qdb("""
-        SELECT d.name, d.is_encrypted, de.encryption_state_desc, de.encryptor_type
+    # encryption_state_desc added in SQL 2019; derive it for older versions
+    _enc_desc = ("de.encryption_state_desc" if ctx.v(15) else
+                 "CASE de.encryption_state "
+                 "WHEN 0 THEN 'NO_DATABASE_ENCRYPTION_KEY' "
+                 "WHEN 1 THEN 'UNENCRYPTED' "
+                 "WHEN 2 THEN 'ENCRYPTION_IN_PROGRESS' "
+                 "WHEN 3 THEN 'ENCRYPTED' "
+                 "WHEN 4 THEN 'KEY_CHANGE_IN_PROGRESS' "
+                 "WHEN 5 THEN 'DECRYPTION_IN_PROGRESS' "
+                 "ELSE CAST(de.encryption_state AS NVARCHAR(50)) END")
+    result["tde"] = record("tde", qdb(f"""
+        SELECT d.name, d.is_encrypted, {_enc_desc} AS encryption_state_desc,
+               de.encryptor_type
         FROM sys.databases d
         LEFT JOIN sys.dm_database_encryption_keys de ON d.database_id=de.database_id
         WHERE d.name=DB_NAME();
@@ -238,7 +278,9 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
 
     # ── Audit ─────────────────────────────────────────────────────────────────
     result["audit"] = record("audit", qdb("""
-        SELECT sa.audit_action_name, sa.class_type_desc, sa.schema_name, sa.object_name
+        SELECT sa.audit_action_name, sa.class_desc AS class_type_desc,
+               ISNULL(OBJECT_SCHEMA_NAME(sa.major_id),'') AS schema_name,
+               ISNULL(OBJECT_NAME(sa.major_id),'')        AS object_name
         FROM sys.database_audit_specifications das
         JOIN sys.database_audit_specification_details sa
           ON das.database_specification_id=sa.database_specification_id
@@ -286,7 +328,7 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
         SELECT
           (SELECT COUNT(*) FROM sys.certificates    WHERE is_active_for_begin_dialog=1) AS certificates,
           (SELECT COUNT(*) FROM sys.asymmetric_keys  WHERE principal_id IS NOT NULL)    AS asymmetric_keys,
-          (SELECT COUNT(*) FROM sys.symmetric_keys   WHERE key_id > 2)                 AS symmetric_keys;
+          (SELECT COUNT(*) FROM sys.symmetric_keys   WHERE symmetric_key_id > 2)        AS symmetric_keys;
     """))
 
     # ── XML ───────────────────────────────────────────────────────────────────
@@ -343,7 +385,7 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
 
     # ── Extended Events ───────────────────────────────────────────────────────
     result["extended_events"] = record("extended_events", qm("""
-        SELECT name, create_time, event_retention_mode_desc
+        SELECT name, create_time, buffer_policy_desc
         FROM sys.dm_xe_sessions WHERE name NOT LIKE 'telemetry_%' ORDER BY name;
     """))
 
@@ -372,14 +414,14 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
     """))
     result["log_shipping_detail"] = record("log_shipping_detail", qm("""
         SELECT p.primary_database, p.backup_directory, p.backup_retention_period,
-               p.backup_threshold, p.threshold_alert_enabled,
-               s.secondary_server, s.secondary_database,
-               s.restore_delay, s.restore_threshold
+               ps.secondary_server, ps.secondary_database,
+               s.restore_delay
         FROM msdb.dbo.log_shipping_primary_databases p
         LEFT JOIN msdb.dbo.log_shipping_primary_secondaries ps
                ON p.primary_id = ps.primary_id
         LEFT JOIN msdb.dbo.log_shipping_secondary_databases s
-               ON ps.secondary_id = s.secondary_id
+               ON ps.secondary_server = s.secondary_server
+              AND ps.secondary_database = s.secondary_database
         ORDER BY p.primary_database;
     """))
 
@@ -399,10 +441,9 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
         result["query_store"] = record("query_store", qdb("""
             SELECT actual_state_desc, desired_state_desc,
                    current_storage_size_mb, max_storage_size_mb,
-                   flush_interval_seconds, data_flush_interval_seconds,
+                   flush_interval_seconds,
                    interval_length_minutes, stale_query_threshold_days,
-                   size_based_cleanup_mode_desc, query_capture_mode_desc,
-                   wait_stats_capture_mode_desc
+                   size_based_cleanup_mode_desc, query_capture_mode_desc
             FROM sys.database_query_store_options;
         """))
     else:
@@ -417,8 +458,8 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
     else:
         result["adr"] = record("adr", na_row("ADR requires SQL 2019+"))
 
-    # ── Stretch Database  (2016, deprecated 2022) ─────────────────────────────
-    if ctx.v(13):
+    # ── Stretch Database  (2016–2022; removed in SQL 2025) ───────────────────
+    if ctx.v(13) and not ctx.v(17):
         result["stretch_db"] = record("stretch_db", qdb("""
             SELECT
               (SELECT COUNT(*) FROM sys.tables
@@ -427,7 +468,8 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
                FROM sys.databases WHERE name = DB_NAME())  AS db_stretch_enabled;
         """))
     else:
-        result["stretch_db"] = record("stretch_db", na_row("Stretch DB requires SQL 2016+"))
+        result["stretch_db"] = record("stretch_db", na_row(
+            "Stretch DB requires SQL 2016+ and was removed in SQL 2025"))
 
     # ── PolyBase / External tables  (2016+) ───────────────────────────────────
     if ctx.v(13):
@@ -437,8 +479,10 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
               (SELECT COUNT(*) FROM sys.external_data_sources) AS external_data_sources,
               (SELECT COUNT(*) FROM sys.external_file_formats) AS external_file_formats;
         """))
-        result["polybase_sources"] = record("polybase_sources", qdb("""
-            SELECT name, type_desc, location, credential_id, pushdown
+        # pushdown column added in SQL 2019; omit for SQL 2016/2017/2018
+        _pb_pushdown = ", pushdown" if ctx.v(15) else ""
+        result["polybase_sources"] = record("polybase_sources", qdb(f"""
+            SELECT name, type_desc, location, credential_id{_pb_pushdown}
             FROM sys.external_data_sources ORDER BY name;
         """))
     else:
@@ -618,12 +662,12 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
     if ctx.has_agent():
         result["backup_encryption"] = record("backup_encryption", qm("""
             SELECT database_name, encryptor_type, encryptor_thumbprint,
-                   key_algorithm, key_length,
+                   key_algorithm,
                    MAX(backup_finish_date) AS last_encrypted_backup
             FROM msdb.dbo.backupset
             WHERE encryptor_thumbprint IS NOT NULL
             GROUP BY database_name, encryptor_type, encryptor_thumbprint,
-                     key_algorithm, key_length
+                     key_algorithm
             ORDER BY database_name;
         """))
     else:
@@ -659,7 +703,6 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
     # ── Event Notifications ───────────────────────────────────────────────────
     result["event_notifications"] = record("event_notifications", qdb("""
         SELECT en.name, en.object_id, en.parent_class_desc,
-               en.event_type, en.source_object_id,
                en.service_name, en.broker_instance
         FROM sys.event_notifications en
         ORDER BY en.name;
@@ -680,7 +723,7 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
             SELECT p.name AS proxy_name, p.enabled, p.description,
                    c.name AS credential_name,
                    STUFF((
-                       SELECT ', ' + ss2.subsystem_name
+                       SELECT ', ' + ss2.subsystem
                        FROM msdb.dbo.sysproxysubsystem ps2
                        JOIN msdb.dbo.syssubsystems ss2 ON ps2.subsystem_id = ss2.subsystem_id
                        WHERE ps2.proxy_id = p.proxy_id
@@ -692,8 +735,9 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
         result["agent_alerts"] = record("agent_alerts", qm("""
             SELECT a.name, a.enabled, a.message_id, a.severity,
                    a.database_name, a.event_description_keyword,
-                   a.notification_message, a.job_name
+                   a.notification_message, j.name AS job_name
             FROM msdb.dbo.sysalerts a
+            LEFT JOIN msdb.dbo.sysjobs j ON a.job_id = j.job_id
             ORDER BY a.name;
         """))
     else:
@@ -721,7 +765,7 @@ def tool_analyze_sql_features(ctx: ServerContext, database: str, out_dir: str) -
     # ── Data-Tier Applications (DAC) ──────────────────────────────────────────
     result["dac_instances"] = record("dac_instances", qm("""
         SELECT instance_name, type_name, type_version,
-               description, create_date
+               description, date_created
         FROM msdb.dbo.sysdac_instances
         ORDER BY instance_name;
     """))

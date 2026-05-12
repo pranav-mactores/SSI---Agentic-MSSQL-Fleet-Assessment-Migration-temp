@@ -29,8 +29,10 @@ def tool_analyze_schema(ctx: ServerContext, database: str, out_dir: str) -> dict
     objects = rq(ctx, """
         SELECT o.type_desc AS object_type, COUNT(*) AS count
         FROM sys.objects o
+        JOIN sys.schemas s ON o.schema_id = s.schema_id
         WHERE o.type IN ('U','V','P','FN','IF','TF','TR','SN','SO','TA')
           AND o.is_ms_shipped = 0
+          AND s.name NOT IN ('sys', 'cdc', 'INFORMATION_SCHEMA')
         GROUP BY o.type_desc ORDER BY count DESC;
     """, database)
 

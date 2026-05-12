@@ -11,7 +11,7 @@ import anthropic
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 from db.connection import ServerContext
-from config.settings import CLAUDE_MODEL, AGENT_MAX_TURNS
+from config.settings import CLAUDE_MODEL
 from tools.schema        import tool_list_databases, tool_analyze_schema
 from tools.features      import tool_analyze_sql_features
 from tools.procedural    import tool_analyze_procedural_code
@@ -387,28 +387,189 @@ def build_system_prompt(ctx: ServerContext) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DATA COLLECTION  (Python-driven, guaranteed coverage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_TRIM_MAX_ROWS = 5
+
+def _trim(obj: Any, max_rows: int = _TRIM_MAX_ROWS, max_str: int = 400) -> Any:
+    """
+    Recursively truncate tool results to stay within Claude's 200k token limit.
+    Strings are capped at max_str chars; lists keep at most max_rows non-error rows.
+    Full data is in CSV — Claude only needs key metrics and error rows.
+    """
+    if isinstance(obj, str):
+        if len(obj) > max_str:
+            return obj[:max_str] + f"[{len(obj) - max_str} chars truncated]"
+        return obj
+    if isinstance(obj, dict):
+        return {k: _trim(v, max_rows, max_str) for k, v in obj.items()}
+    if isinstance(obj, list):
+        errors    = [x for x in obj if isinstance(x, dict) and x.get("_error")]
+        non_err   = [x for x in obj if not (isinstance(x, dict) and x.get("_error"))]
+        keep_n    = max(0, max_rows - len(errors))
+        kept      = errors + [_trim(x, max_rows, max_str) for x in non_err[:keep_n]]
+        omitted   = len(non_err) - keep_n
+        if omitted > 0:
+            kept.append({"_note": f"{omitted} more rows omitted — see CSV for full data"})
+        return kept
+    return obj
+
+
+def _compact_features(result: dict) -> dict:
+    """
+    Replace per-feature row lists with one-liner status strings for Phase 2.
+    Reduces analyze_sql_features from hundreds of rows to ~30 key:string pairs.
+    Full feature data is already in the features CSV.
+    """
+    SKIP = {"database", "csv_path"}
+    out: dict = {}
+    for k, v in result.items():
+        if k in SKIP or not isinstance(v, list):
+            out[k] = v
+            continue
+        errors  = [r for r in v if isinstance(r, dict) and r.get("_error")]
+        actives = [r for r in v if isinstance(r, dict) and not r.get("_error") and not r.get("_note")]
+        if errors:
+            out[k] = f"ERROR: {str(errors[0].get('_error', ''))[:120]}"
+        elif actives:
+            out[k] = f"DETECTED ({len(actives)} rows) — see CSV"
+        else:
+            out[k] = "not detected / inactive"
+    return out
+
+
+def _collect_all_data(
+    dispatch: dict[str, Any], ctx: ServerContext
+) -> tuple[list[dict], list[dict]]:
+    """
+    Call every analysis tool directly in Python — no Claude involvement.
+
+    Returns (tool_use_blocks, tool_result_blocks) formatted as Anthropic
+    API content blocks.  Callers inject these as a single synthetic
+    assistant + user turn so Claude sees exactly what it would have seen
+    if it had called the tools itself, but every database is guaranteed
+    to be covered regardless of turn limits.
+    """
+    tool_use_blocks: list[dict]    = []
+    tool_result_blocks: list[dict] = []
+    _idx = 0
+    _max_rows = _TRIM_MAX_ROWS  # updated below after we know the database count
+
+    def _run(name: str, inputs: dict) -> dict:
+        nonlocal _idx
+        call_id = f"pre_{_idx}"
+        _idx += 1
+        print(f"  [collect] {name}({json.dumps(inputs) if inputs else ''})")
+        try:
+            result = dispatch[name](inputs)
+        except Exception as e:
+            print(f"  [collect]   ✗ {name} error: {e}")
+            result = {"_error": str(e)}
+        tool_use_blocks.append(
+            {"type": "tool_use", "id": call_id, "name": name, "input": inputs}
+        )
+        # Features tool: collapse per-feature rows to one-liner summaries.
+        # Everything else: trim lists to _max_rows (adaptive per db count).
+        if name == "analyze_sql_features":
+            payload = _compact_features(result)
+        else:
+            payload = _trim(result, _max_rows)
+        tool_result_blocks.append(
+            {"type": "tool_result", "tool_use_id": call_id,
+             "content": json.dumps(payload, default=str)}
+        )
+        return result
+
+    # 1. Discover all user databases
+    db_data   = _run("list_databases", {})
+    databases = [
+        r["name"] for r in db_data.get("databases", [])
+        if isinstance(r, dict) and r.get("name") and not r.get("_error")
+    ]
+    print(f"  [collect] {len(databases)} user database(s): {', '.join(databases)}")
+
+    # Scale down rows-per-list so total payload stays under 200k tokens.
+    # Budget: ~60 effective rows across all per-db calls; min 2 to keep errors visible.
+    _max_rows = max(2, min(_TRIM_MAX_ROWS, 60 // max(1, len(databases))))
+
+    # 2. Per-database tools — Python loop guarantees every DB is covered
+    for db in databases:
+        _run("analyze_schema",          {"database": db})
+        _run("analyze_sql_features",    {"database": db})
+        _run("analyze_procedural_code", {"database": db})
+
+    # 3. Server-wide tools (run once)
+    _run("analyze_jobs",           {})
+    _run("analyze_performance",    {})
+    _run("analyze_backups",        {})
+    _run("analyze_linked_servers", {})
+    _run("analyze_database_mail",  {})
+
+    return tool_use_blocks, tool_result_blocks
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AGENT LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def run_agent(ctx: ServerContext, out_dir: str, max_turns: int = 40) -> str:
-    client   = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from environment
-    tools    = build_tools()
+def run_agent(ctx: ServerContext, out_dir: str) -> str:
+    """
+    Two-phase execution:
+      Phase 1 — Python drives all data collection deterministically.
+                 Every database in 01_databases.csv is analysed.
+      Phase 2 — Claude synthesises the report.  execute_sql is the only
+                 tool available; Claude uses it to retry any _error rows
+                 with version/edition-correct queries before writing the
+                 final report.
+    """
+    client   = anthropic.AnthropicBedrock(
+        aws_access_key=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        aws_region=os.environ.get("AWS_REGION", "us-east-1"),
+    )
     dispatch = build_dispatch(ctx, out_dir)
     system   = build_system_prompt(ctx)
 
-    messages: list[dict] = [{
-        "role": "user",
-        "content": "Analyse this SQL Server instance and produce a full migration assessment report.",
-    }]
+    # ── Phase 1: collect all data ─────────────────────────────────────────────
+    print("  [agent] Phase 1 — collecting data from all databases...")
+    tool_use_blocks, tool_result_blocks = _collect_all_data(dispatch, ctx)
 
-    for turn in range(1, max_turns + 1):
-        print(f"  [agent] Turn {turn}...")
+    # Inject collected results as a synthetic conversation turn so Claude
+    # receives the same structured data it would have gathered itself.
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": "Analyse this SQL Server instance and produce a full migration assessment report.",
+        },
+        {
+            "role": "assistant",
+            "content": tool_use_blocks,
+        },
+        {
+            "role": "user",
+            "content": tool_result_blocks,
+        },
+    ]
+
+    # ── Phase 2: synthesis + DMV error recovery ───────────────────────────────
+    # Expose only execute_sql so Claude can retry failed DMV queries with
+    # version-appropriate rewrites.  All other data is already collected.
+    recovery_tools = [t for t in build_tools() if t["name"] == "execute_sql"]
+
+    print(f"  [agent] Phase 2 — synthesizing "
+          f"({len(tool_use_blocks)} tool results; execute_sql available for error recovery)...")
+
+    for turn in range(1, 25):
+        if turn > 1:
+            print(f"  [agent] Phase 2 turn {turn} (DMV error recovery)...")
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=CLAUDE_MODEL,
             max_tokens=8096,
             system=system,
-            tools=tools,
+            tools=recovery_tools,
             messages=messages,
         )
         messages.append({"role": "assistant", "content": response.content})
@@ -419,30 +580,37 @@ def run_agent(ctx: ServerContext, out_dir: str, max_turns: int = 40) -> str:
                     return block.text
             return "(No text output)"
 
+        # Handle execute_sql calls — the only tool Claude can call here
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
             inp = block.input or {}
-            print(f"  [agent]   → {block.name}({json.dumps(inp) if inp else ''})")
+            print(f"  [agent]   >> execute_sql  purpose={inp.get('purpose', '')[:60]}")
             try:
-                result = dispatch[block.name](inp)
+                result = dispatch["execute_sql"](inp)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": json.dumps(result, default=str),
                 })
             except Exception as e:
-                print(f"  [agent]   ✗ {block.name} error: {e}")
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps({"error": str(e)}),
+                    "content": json.dumps({"_error": str(e)}),
                     "is_error": True,
                 })
+
+        if not tool_results:
+            for block in response.content:
+                if hasattr(block, "text"):
+                    return block.text
+            return "(No text output)"
+
         messages.append({"role": "user", "content": tool_results})
 
-    return "(Reached max_turns)"
+    return "(Reached error-recovery turn limit)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

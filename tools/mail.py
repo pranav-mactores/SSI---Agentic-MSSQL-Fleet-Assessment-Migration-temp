@@ -9,10 +9,12 @@ def tool_analyze_database_mail(ctx: ServerContext, out_dir: str) -> dict:
         return {"_not_applicable": "Express edition"}
     rows = rq(ctx, """
         SELECT p.name AS profile_name, a.name AS account_name,
-               a.email_address, a.mailserver_name, a.mailserver_type
+               a.email_address, ms.servername AS mailserver_name, ms.servertype AS mailserver_type
         FROM msdb.dbo.sysmail_profile       p
         JOIN msdb.dbo.sysmail_profileaccount pa ON p.profile_id=pa.profile_id
-        JOIN msdb.dbo.sysmail_account        a  ON pa.account_id=a.account_id ORDER BY p.name;
+        JOIN msdb.dbo.sysmail_account        a  ON pa.account_id=a.account_id
+        LEFT JOIN msdb.dbo.sysmail_server    ms ON a.account_id=ms.account_id
+        ORDER BY p.name;
     """)
     write_csv(f"{out_dir}/08_database_mail.csv", rows)
     return {"database_mail": rows}

@@ -53,12 +53,17 @@ DEEP_TRIGGER_FLAGS = {
     "risk_undocumented_proc", "risk_waitfor", "risk_xp_other",
 }
 
-_client: anthropic.Anthropic | None = None
+_client: anthropic.AnthropicBedrock | None = None
 
-def _claude() -> anthropic.Anthropic:
+def _claude() -> anthropic.AnthropicBedrock:
     global _client
     if _client is None:
-        _client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from env
+        import os
+        _client = anthropic.AnthropicBedrock(
+            aws_access_key=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            aws_region=os.environ.get("AWS_REGION", "us-east-1"),
+        )
     return _client
 
 
