@@ -48,8 +48,9 @@ get_anthropic_api_key()
 from db.connection import connect, detect_server
 from agent.loop    import run_agent
 from agent.state   import StateManager
-from reports.csv_writer import write_csv, safe_slug
+from reports.csv_writer import write_csv, read_csv, safe_slug
 from reports.summary    import generate_server_summary_csv
+from reports.merge_csvs import merge_per_db_csvs
 
 
 def _now() -> str:
@@ -118,6 +119,13 @@ def process_server(row: dict, out_root: str,
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(header + report_md)
         print(f"  [done] Narrative report → {md_path}")
+
+        # Merge per-database CSVs into combined *_all.csv files
+        db_rows   = read_csv(os.path.join(out_dir, "01_databases.csv"))
+        databases = [r["name"] for r in db_rows if r.get("name") and not r.get("_error")]
+        if databases:
+            print(f"  [merge] Merging per-database CSVs ({len(databases)} databases)...")
+            merge_per_db_csvs(out_dir, databases)
 
         summary_csv = generate_server_summary_csv(ctx, out_dir, server, port)
 
